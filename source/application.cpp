@@ -1,17 +1,15 @@
-﻿#define GLM_FORCE_DEPTH_ZERO_TO_ONE // иначе ortho-проекция отсекает всё ниже Z=0
+﻿#define GLM_FORCE_DEPTH_ZERO_TO_ONE 
 
 #include "application.hpp"
 
 #include <cstring>
 #include <iostream>
-
 #include <fstream>
 #include <vector>
-
 #include <cmath>
+#include <string>
 
 #include <imgui.h>
-
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
@@ -19,13 +17,11 @@
 
 namespace {
 
-    // одна вершина: позиция (X, Y, Z) и цвет (R, G, B)
     struct Vertex {
         float position[3];
         float color[3];
     };
 
-    // читает .spv-файл и создаёт VkShaderModule
     VkShaderModule loadShaderModule(const char* path) {
         std::ifstream file(path, std::ios::binary | std::ios::ate);
         if (!file) {
@@ -61,43 +57,42 @@ namespace application {
 
     namespace {
 
-        // куб: 8 вершин — по одной на каждый угол
-        // цвет каждой вершины вычислен по формуле (position + 1) / 2
-        // это даёт плавный градиент между углами куба
+        constexpr uint32_t cube_count = 3;
+
         const Vertex cube_vertices[] = {
-            // position                   // color = (pos + 1) / 2
-            { { -1.0f, -1.0f, -1.0f }, { 0.0f, 0.0f, 0.0f } }, // 0: (-,-,-)
-            { {  1.0f, -1.0f, -1.0f }, { 1.0f, 0.0f, 0.0f } }, // 1: (+,-,-)
-            { {  1.0f,  1.0f, -1.0f }, { 1.0f, 1.0f, 0.0f } }, // 2: (+,+,-)
-            { { -1.0f,  1.0f, -1.0f }, { 0.0f, 1.0f, 0.0f } }, // 3: (-,+,-)
-            { { -1.0f, -1.0f,  1.0f }, { 0.0f, 0.0f, 1.0f } }, // 4: (-,-,+)
-            { {  1.0f, -1.0f,  1.0f }, { 1.0f, 0.0f, 1.0f } }, // 5: (+,-,+)
-            { {  1.0f,  1.0f,  1.0f }, { 1.0f, 1.0f, 1.0f } }, // 6: (+,+,+)
-            { { -1.0f,  1.0f,  1.0f }, { 0.0f, 1.0f, 1.0f } }, // 7: (-,+,+)
+            { { -1.0f, -1.0f, -1.0f }, { 0.15f, 0.15f, 0.15f } }, 
+            { {  1.0f, -1.0f, -1.0f }, { 0.95f, 0.15f, 0.15f } }, 
+            { {  1.0f,  1.0f, -1.0f }, { 0.95f, 0.95f, 0.15f } }, 
+            { { -1.0f,  1.0f, -1.0f }, { 0.15f, 0.95f, 0.15f } }, 
+            { { -1.0f, -1.0f,  1.0f }, { 0.15f, 0.15f, 0.95f } }, 
+            { {  1.0f, -1.0f,  1.0f }, { 0.95f, 0.15f, 0.95f } }, 
+            { {  1.0f,  1.0f,  1.0f }, { 0.95f, 0.95f, 0.95f } }, 
+            { { -1.0f,  1.0f,  1.0f }, { 0.15f, 0.95f, 0.95f } }, 
         };
 
-        // 12 треугольников × 3 индекса = 36
-        // обход против часовой стрелки (counter-clockwise) для лицевых граней
         const uint32_t cube_indices[] = {
-            // задняя грань (-Z)
             0, 3, 2,  0, 2, 1,
-            // передняя грань (+Z)
             4, 5, 6,  4, 6, 7,
-            // левая грань (-X)
             0, 4, 7,  0, 7, 3,
-            // правая грань (+X)
             1, 2, 6,  1, 6, 5,
-            // верхняя грань (+Y)
             3, 7, 6,  3, 6, 2,
-            // нижняя грань (-Y)
             0, 1, 5,  0, 5, 4,
+
+            0, 1,  1, 2,  2, 3,  3, 0,
+            4, 5,  5, 6,  6, 7,  7, 4,
+            0, 4,  1, 5,  2, 6,  3, 7
         };
 
-        // вершинный буфер на GPU
+        constexpr uint32_t TRIANGLE_INDEX_COUNT = 36;
+        constexpr uint32_t EDGE_INDEX_OFFSET = 36;
+        constexpr uint32_t EDGE_INDEX_COUNT = 24;
+
         VkBuffer vk_vertex_buffer = VK_NULL_HANDLE;
         VmaAllocation vk_vertex_buffer_allocation = VK_NULL_HANDLE;
 
-        // создаёт вершинный буфер и заливает в него данные куба
+        VkBuffer vk_index_buffer = VK_NULL_HANDLE;
+        VmaAllocation vk_index_buffer_allocation = VK_NULL_HANDLE;
+
         bool createVertexBuffer() {
             const VkBufferCreateInfo buffer_info = {
                 .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -122,18 +117,10 @@ namespace application {
                 return false;
             }
 
-            std::memcpy(allocation_info.pMappedData,
-                cube_vertices,
-                sizeof(cube_vertices));
-
+            std::memcpy(allocation_info.pMappedData, cube_vertices, sizeof(cube_vertices));
             return true;
         }
 
-        // индексный буфер на GPU
-        VkBuffer vk_index_buffer = VK_NULL_HANDLE;
-        VmaAllocation vk_index_buffer_allocation = VK_NULL_HANDLE;
-
-        // создаёт индексный буфер и заливает в него индексы
         bool createIndexBuffer() {
             const VkBufferCreateInfo buffer_info = {
                 .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -158,14 +145,10 @@ namespace application {
                 return false;
             }
 
-            std::memcpy(allocation_info.pMappedData,
-                cube_indices,
-                sizeof(cube_indices));
-
+            std::memcpy(allocation_info.pMappedData, cube_indices, sizeof(cube_indices));
             return true;
         }
 
-        // данные всей сцены: view и proj
         struct SceneUniforms {
             glm::mat4 view;
             glm::mat4 proj;
@@ -175,18 +158,24 @@ namespace application {
         VmaAllocation vk_scene_uniform_buffer_allocation = VK_NULL_HANDLE;
         SceneUniforms* vk_scene_uniform_buffer_mapped = nullptr;
 
-        // данные объекта: model-матрица и цвет
         struct ModelUniform {
             glm::mat4 model;
             glm::vec3 color;
             float _padding;
         };
 
-        VkBuffer vk_model_uniform_buffer = VK_NULL_HANDLE;
-        VmaAllocation vk_model_uniform_buffer_allocation = VK_NULL_HANDLE;
-        ModelUniform* vk_model_uniform_buffer_mapped = nullptr;
+        VkBuffer vk_model_uniform_buffers[cube_count] = {};
+        VmaAllocation vk_model_uniform_buffer_allocations[cube_count] = {};
+        ModelUniform* vk_model_uniform_buffer_mapped[cube_count] = {};
 
-        // создаёт Scene-буфер (один на сцену) и Model-буфер (для объекта)
+        VkDescriptorSet vk_model_descriptor_sets[cube_count] = {};
+
+        const glm::vec3 cube_offsets[cube_count] = {
+            { -3.0f, 0.0f, 0.0f },
+            {  0.0f, 0.0f, 0.0f },
+            {  3.0f, 0.0f, 0.0f },
+        };
+
         bool createUniformBuffers() {
             {
                 const VkBufferCreateInfo buffer_info = {
@@ -220,7 +209,7 @@ namespace application {
                 vk_scene_uniform_buffer_mapped->proj = glm::mat4(1.0f);
             }
 
-            {
+            for (uint32_t i = 0; i < cube_count; ++i) {
                 const VkBufferCreateInfo buffer_info = {
                     .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                     .size = sizeof(ModelUniform),
@@ -238,34 +227,31 @@ namespace application {
 
                 if (vmaCreateBuffer(graphics::internal::context.allocator,
                     &buffer_info, &alloc_info,
-                    &vk_model_uniform_buffer,
-                    &vk_model_uniform_buffer_allocation,
+                    &vk_model_uniform_buffers[i],
+                    &vk_model_uniform_buffer_allocations[i],
                     &allocation_info) != VK_SUCCESS) {
-                    std::cerr << "Failed to create model uniform buffer\n";
+                    std::cerr << "Failed to create model uniform buffer #" << i << '\n';
                     return false;
                 }
 
-                vk_model_uniform_buffer_mapped =
+                vk_model_uniform_buffer_mapped[i] =
                     static_cast<ModelUniform*>(allocation_info.pMappedData);
 
-                vk_model_uniform_buffer_mapped->model = glm::mat4(1.0f);
-                vk_model_uniform_buffer_mapped->color = glm::vec3(1.0f);
-                vk_model_uniform_buffer_mapped->_padding = 0.0f;
+                vk_model_uniform_buffer_mapped[i]->model = glm::mat4(1.0f);
+                vk_model_uniform_buffer_mapped[i]->color = glm::vec3(1.0f);
+                vk_model_uniform_buffer_mapped[i]->_padding = 0.0f;
             }
 
             return true;
         }
 
-        // два set layout: set 0 — Scene, set 1 — Model
         VkDescriptorSetLayout vk_scene_descriptor_set_layout = VK_NULL_HANDLE;
         VkDescriptorSetLayout vk_model_descriptor_set_layout = VK_NULL_HANDLE;
         VkDescriptorPool vk_descriptor_pool = VK_NULL_HANDLE;
         VkDescriptorSet vk_scene_descriptor_set = VK_NULL_HANDLE;
-        VkDescriptorSet vk_model_descriptor_set = VK_NULL_HANDLE;
         VkPipelineLayout vk_pipeline_layout = VK_NULL_HANDLE;
         VkPipeline vk_pipeline = VK_NULL_HANDLE;
 
-        // создаёт set layout'ы, pipeline layout, пул и наборы дескрипторов
         bool createDescriptors() {
             const VkDescriptorSetLayoutBinding scene_binding = {
                 .binding = 0,
@@ -327,12 +313,12 @@ namespace application {
 
             const VkDescriptorPoolSize pool_size = {
                 .type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                .descriptorCount = 2,
+                .descriptorCount = 1 + cube_count,
             };
 
             const VkDescriptorPoolCreateInfo pool_info = {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                .maxSets = 2,
+                .maxSets = 1 + cube_count,
                 .poolSizeCount = 1,
                 .pPoolSizes = &pool_size,
             };
@@ -358,18 +344,20 @@ namespace application {
                 return false;
             }
 
-            const VkDescriptorSetAllocateInfo model_alloc_info = {
-                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-                .descriptorPool = vk_descriptor_pool,
-                .descriptorSetCount = 1,
-                .pSetLayouts = &vk_model_descriptor_set_layout,
-            };
+            for (uint32_t i = 0; i < cube_count; ++i) {
+                const VkDescriptorSetAllocateInfo model_alloc_info = {
+                    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                    .descriptorPool = vk_descriptor_pool,
+                    .descriptorSetCount = 1,
+                    .pSetLayouts = &vk_model_descriptor_set_layout,
+                };
 
-            if (vkAllocateDescriptorSets(graphics::internal::context.device,
-                &model_alloc_info,
-                &vk_model_descriptor_set) != VK_SUCCESS) {
-                std::cerr << "Failed to allocate model descriptor set\n";
-                return false;
+                if (vkAllocateDescriptorSets(graphics::internal::context.device,
+                    &model_alloc_info,
+                    &vk_model_descriptor_sets[i]) != VK_SUCCESS) {
+                    std::cerr << "Failed to allocate model descriptor set #" << i << '\n';
+                    return false;
+                }
             }
 
             {
@@ -393,16 +381,16 @@ namespace application {
                     1, &write, 0, nullptr);
             }
 
-            {
+            for (uint32_t i = 0; i < cube_count; ++i) {
                 const VkDescriptorBufferInfo buffer_info = {
-                    .buffer = vk_model_uniform_buffer,
+                    .buffer = vk_model_uniform_buffers[i],
                     .offset = 0,
                     .range = sizeof(ModelUniform),
                 };
 
                 const VkWriteDescriptorSet write = {
                     .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                    .dstSet = vk_model_descriptor_set,
+                    .dstSet = vk_model_descriptor_sets[i],
                     .dstBinding = 0,
                     .dstArrayElement = 0,
                     .descriptorCount = 1,
@@ -417,7 +405,6 @@ namespace application {
             return true;
         }
 
-        // собирает графический пайплайн
         bool createPipeline() {
             VkShaderModule vert_module = loadShaderModule("shaders/cube.vert.spv");
             VkShaderModule frag_module = loadShaderModule("shaders/cube.frag.spv");
@@ -483,13 +470,12 @@ namespace application {
                 .scissorCount = 1,
             };
 
-            // лицевая грань — против часовой, отсекаем задние
             const VkPipelineRasterizationStateCreateInfo rasterization = {
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
                 .depthClampEnable = VK_FALSE,
                 .rasterizerDiscardEnable = VK_FALSE,
                 .polygonMode = VK_POLYGON_MODE_FILL,
-                .cullMode = VK_CULL_MODE_BACK_BIT,
+                .cullMode = VK_CULL_MODE_NONE,
                 .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
                 .depthBiasEnable = VK_FALSE,
                 .lineWidth = 1.0f,
@@ -505,7 +491,7 @@ namespace application {
                 .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
                 .depthTestEnable = VK_TRUE,
                 .depthWriteEnable = VK_TRUE,
-                .depthCompareOp = VK_COMPARE_OP_LESS,
+                .depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL,
                 .depthBoundsTestEnable = VK_FALSE,
                 .stencilTestEnable = VK_FALSE,
             };
@@ -567,9 +553,47 @@ namespace application {
 
             return true;
         }
+
+        struct CubeSettings {
+            glm::vec3 position;      
+            glm::vec3 rotationDeg;   
+            glm::vec3 scale;         
+            glm::vec3 color;        
+            bool animate;            
+            float phaseOffset;       
+        };
+
+        CubeSettings cube_settings[cube_count] = {
+            {
+                glm::vec3(0.0f, 0.0f, 0.0f),
+                glm::vec3(0.0f, 0.0f, 0.0f),
+                glm::vec3(0.7f, 0.7f, 0.7f),
+                glm::vec3(1.0f, 1.0f, 1.0f),
+                true,
+                0.0f,
+            },
+
+            {
+                glm::vec3(0.0f, 0.0f, 0.0f),
+                glm::vec3(0.0f, 0.0f, 0.0f),
+                glm::vec3(0.7f, 0.7f, 0.7f),
+                glm::vec3(1.0f, 0.8f, 0.8f),
+                true,
+                2.094f, 
+            },
+
+            {
+                glm::vec3(0.0f, 0.0f, 0.0f),
+                glm::vec3(0.0f, 0.0f, 0.0f),
+                glm::vec3(0.7f, 0.7f, 0.7f),
+                glm::vec3(0.8f, 0.9f, 1.0f),
+                true,
+                4.188f, 
+            },
+        };
+
     } // namespace
 
-    // создаёт все Vulkan-объекты приложения
     bool initialize() {
         if (!createVertexBuffer()) return false;
         if (!createIndexBuffer()) return false;
@@ -579,7 +603,6 @@ namespace application {
         return true;
     }
 
-    // уничтожает все объекты в порядке, обратном созданию
     void shutdown() {
         auto& context = graphics::internal::context;
         vkQueueWaitIdle(context.graphics_queue);
@@ -596,7 +619,9 @@ namespace application {
             vkDestroyDescriptorPool(context.device, vk_descriptor_pool, nullptr);
             vk_descriptor_pool = VK_NULL_HANDLE;
             vk_scene_descriptor_set = VK_NULL_HANDLE;
-            vk_model_descriptor_set = VK_NULL_HANDLE;
+            for (uint32_t i = 0; i < cube_count; ++i) {
+                vk_model_descriptor_sets[i] = VK_NULL_HANDLE;
+            }
         }
         if (vk_scene_descriptor_set_layout != VK_NULL_HANDLE) {
             vkDestroyDescriptorSetLayout(context.device, vk_scene_descriptor_set_layout, nullptr);
@@ -613,12 +638,14 @@ namespace application {
             vk_scene_uniform_buffer = VK_NULL_HANDLE;
             vk_scene_uniform_buffer_mapped = nullptr;
         }
-        if (vk_model_uniform_buffer != VK_NULL_HANDLE) {
-            vmaDestroyBuffer(context.allocator,
-                vk_model_uniform_buffer,
-                vk_model_uniform_buffer_allocation);
-            vk_model_uniform_buffer = VK_NULL_HANDLE;
-            vk_model_uniform_buffer_mapped = nullptr;
+        for (uint32_t i = 0; i < cube_count; ++i) {
+            if (vk_model_uniform_buffers[i] != VK_NULL_HANDLE) {
+                vmaDestroyBuffer(context.allocator,
+                    vk_model_uniform_buffers[i],
+                    vk_model_uniform_buffer_allocations[i]);
+                vk_model_uniform_buffers[i] = VK_NULL_HANDLE;
+                vk_model_uniform_buffer_mapped[i] = nullptr;
+            }
         }
         if (vk_vertex_buffer != VK_NULL_HANDLE) {
             vmaDestroyBuffer(context.allocator, vk_vertex_buffer, vk_vertex_buffer_allocation);
@@ -630,21 +657,15 @@ namespace application {
         }
     }
 
-    // обновление данных сцены и интерфейса каждый кадр
     void update(double time) {
         const auto& extent = graphics::internal::context.swapchain_extent;
         const float aspect = float(extent.width) / float(extent.height);
 
         static int projection_mode = 0;
-        static glm::vec3 manual_position = glm::vec3(0.0f);
-        static glm::vec3 manual_rotation = glm::vec3(0.0f);
-        static glm::vec3 scale = glm::vec3(1.0f);
-        static glm::vec3 color = glm::vec3(1.0f);
-
         static bool is_playing = false;
         static float anim_speed = 1.0f;
         static float anim_radius = 1.5f;
-        static float anim_height = 0.3f;
+        static float anim_height = 0.5f;
         static float anim_angle = 0.0f;
 
         static double last_time = time;
@@ -658,7 +679,7 @@ namespace application {
             }
         }
 
-        ImGui::Begin("Cube controls");
+        ImGui::Begin("Lab 1: Cube controls");
 
         ImGui::Text("Projection:");
         ImGui::RadioButton("Perspective", &projection_mode, 0);
@@ -666,40 +687,40 @@ namespace application {
         ImGui::RadioButton("Orthographic", &projection_mode, 1);
 
         ImGui::Separator();
-        ImGui::SliderFloat3("Position", &manual_position.x, -3.0f, 3.0f);
-        ImGui::SliderFloat3("Rotation", &manual_rotation.x, -180.0f, 180.0f);
-        ImGui::SliderFloat3("Scale", &scale.x, 0.1f, 3.0f);
-
-        ImGui::Separator();
-        ImGui::Text("Color:");
-        ImGui::ColorEdit3("Base color", &color.x);
-
-        ImGui::Separator();
-        ImGui::Text("Animation:");
-        ImGui::Checkbox("Animation", &is_playing);
-        ImGui::SliderFloat("Speed", &anim_speed, -3.0f, 3.0f);
-        ImGui::SliderFloat("Radius", &anim_radius, 0.0f, 3.0f);
-        ImGui::SliderFloat("Height", &anim_height, -1.0f, 1.0f);
+        ImGui::Text("Global animation (Lissajous):");
+        ImGui::Checkbox("Animation##global", &is_playing);
+        ImGui::SliderFloat("Speed##global", &anim_speed, -3.0f, 3.0f);
+        ImGui::SliderFloat("Radius##global", &anim_radius, 0.0f, 3.0f);
+        ImGui::SliderFloat("Height##global", &anim_height, -1.5f, 1.5f);
         ImGui::Text("Angle: %.2f rad", anim_angle);
+
+        ImGui::Separator();
+        ImGui::Text("Objects (multiple descriptor sets):");
+
+        for (uint32_t i = 0; i < cube_count; ++i) {
+            const std::string label = "Cube #" + std::to_string(i + 1);
+            if (ImGui::TreeNode(label.c_str())) {
+                CubeSettings& s = cube_settings[i];
+
+                ImGui::Checkbox("Animate", &s.animate);
+                ImGui::SliderFloat("Phase offset", &s.phaseOffset, -6.28f, 6.28f, "%.2f rad");
+
+                ImGui::Separator();
+
+                ImGui::SliderFloat3("Position", &s.position.x, -5.0f, 5.0f);
+                ImGui::SliderFloat3("Rotation", &s.rotationDeg.x, -180.0f, 180.0f);
+                ImGui::SliderFloat3("Scale", &s.scale.x, 0.1f, 3.0f);
+                ImGui::ColorEdit3("Color", &s.color.x);
+
+                ImGui::TreePop();
+            }
+        }
 
         ImGui::End();
 
-        glm::mat4 model = glm::mat4(1.0f);
-
-        glm::vec3 final_position = manual_position;
-        final_position.x += anim_radius * std::cos(anim_angle);
-        final_position.z += anim_radius * std::sin(anim_angle * 2.0f);
-        final_position.y += anim_height;
-
-        model = glm::translate(model, final_position);
-        model = glm::rotate(model, glm::radians(manual_rotation.x), glm::vec3(1, 0, 0));
-        model = glm::rotate(model, glm::radians(manual_rotation.y) + anim_angle * 2.0f, glm::vec3(0, 1, 0));
-        model = glm::rotate(model, glm::radians(manual_rotation.z), glm::vec3(0, 0, 1));
-        model = glm::scale(model, scale);
-
         glm::mat4 view = glm::lookAt(
-            glm::vec3(2.5f, 2.0f, 3.5f),
-            glm::vec3(0.0f, 0.0f, 0.0f),
+            glm::vec3(0.0f, 0.0f, 9.0f), 
+            glm::vec3(0.0f, 0.0f, 0.0f), 
             glm::vec3(0.0f, 1.0f, 0.0f)
         );
 
@@ -708,7 +729,7 @@ namespace application {
             proj = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 100.0f);
         }
         else {
-            float ortho_size = 3.0f;
+            float ortho_size = 6.0f;
             proj = glm::ortho(
                 -ortho_size * aspect, ortho_size * aspect,
                 -ortho_size, ortho_size,
@@ -720,11 +741,32 @@ namespace application {
         vk_scene_uniform_buffer_mapped->view = view;
         vk_scene_uniform_buffer_mapped->proj = proj;
 
-        vk_model_uniform_buffer_mapped->model = model;
-        vk_model_uniform_buffer_mapped->color = color;
+        for (uint32_t i = 0; i < cube_count; ++i) {
+            CubeSettings& s = cube_settings[i];
+
+            glm::vec3 final_position = cube_offsets[i] + s.position;
+            glm::vec3 final_rotation = s.rotationDeg;
+
+            if (s.animate) {
+                const float phase = anim_angle + s.phaseOffset;
+                final_position.x += anim_radius * std::cos(phase);
+                final_position.z += anim_radius * std::sin(phase * 2.0f); 
+                final_position.y += anim_height * std::sin(phase * 3.0f); 
+                final_rotation.y += anim_angle * 40.0f + s.phaseOffset * 30.0f;
+            }
+
+            glm::mat4 model = glm::mat4(1.0f);
+            model = glm::translate(model, final_position);
+            model = glm::rotate(model, glm::radians(final_rotation.x), glm::vec3(1, 0, 0));
+            model = glm::rotate(model, glm::radians(final_rotation.y), glm::vec3(0, 1, 0));
+            model = glm::rotate(model, glm::radians(final_rotation.z), glm::vec3(0, 0, 1));
+            model = glm::scale(model, s.scale);
+
+            vk_model_uniform_buffer_mapped[i]->model = model;
+            vk_model_uniform_buffer_mapped[i]->color = s.color;
+        }
     }
 
-    // запись команд рендера в командный буфер текущего кадра
     void render(const graphics::internal::FrameData& fd) {
         vkResetCommandBuffer(fd.command_buffer, 0);
 
@@ -736,7 +778,7 @@ namespace application {
         vkBeginCommandBuffer(fd.command_buffer, &command_buffer_begin);
 
         const VkClearValue clear_values[] = {
-            {.color = {.float32 = { 0.1f, 0.1f, 0.1f, 1.0f } } },
+            {.color = {.float32 = { 0.08f, 0.09f, 0.12f, 1.0f } } },
             {.depthStencil = { 1.0f, 0 } },
         };
 
@@ -776,14 +818,16 @@ namespace application {
             0, 1, &vk_scene_descriptor_set,
             0, nullptr);
 
-        vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-            vk_pipeline_layout,
-            1, 1, &vk_model_descriptor_set,
-            0, nullptr);
+        for (uint32_t i = 0; i < cube_count; ++i) {
+            vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                vk_pipeline_layout,
+                1, 1, &vk_model_descriptor_sets[i],
+                0, nullptr);
 
-        vkCmdDrawIndexed(fd.command_buffer,
-            sizeof(cube_indices) / sizeof(cube_indices[0]),
-            1, 0, 0, 0);
+            vkCmdDrawIndexed(fd.command_buffer, TRIANGLE_INDEX_COUNT, 1, 0, 0, 0);
+
+            vkCmdDrawIndexed(fd.command_buffer, EDGE_INDEX_COUNT, 1, EDGE_INDEX_OFFSET, 0, 0);
+        }
 
         vkCmdEndRenderPass(fd.command_buffer);
         vkEndCommandBuffer(fd.command_buffer);
