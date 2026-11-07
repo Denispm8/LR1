@@ -2,6 +2,7 @@
 #include <climits>
 
 #include <iostream>
+#include <exception>
 
 #define GLFW_INCLUDE_NONE
 #include <GLFW/glfw3.h>
@@ -17,7 +18,7 @@ namespace {
 constexpr int32_t default_window_width = 1280;
 constexpr int32_t default_window_height = 720;
 
-constexpr char default_window_title[] = "Vulkan Starter App";
+constexpr char default_window_title[] = "Cube";
 
 GLFWwindow* glfw_window;
 
@@ -76,19 +77,28 @@ int main() {
 		const double time = glfwGetTime();
 
 		glfwPollEvents();
+		graphics::internal::FrameData fd = graphics::internal::prepare();
+		if (fd.command_buffer == VK_NULL_HANDLE || fd.framebuffer == VK_NULL_HANDLE) {
+			status = EXIT_FAILURE;
+			break;
+		}
 		ImGui_ImplGlfw_NewFrame();
 
 		ImGui::NewFrame();
-		application::update(time);
-		ImGui::Render();
-
-		graphics::internal::FrameData fd = graphics::internal::prepare();
-		application::render(fd);
-		graphics::internal::submitAndPresent();
+		try {
+			application::update(time);
+			ImGui::Render();
+			application::render(fd);
+			graphics::internal::submitAndPresent();
+		} catch (const std::exception& error) {
+			std::cerr << error.what() << '\n';
+			status = EXIT_FAILURE;
+			break;
+		}
 	}
 
-	application::shutdown();
 err_application_init:
+	application::shutdown();
 	graphics::internal::shutdown();
 err_graphics_init:
 	ImGui_ImplGlfw_Shutdown();
@@ -99,5 +109,5 @@ err_imgui_init:
 err_null_window:
 	glfwTerminate();
 
-	return 0;
+	return status;
 }

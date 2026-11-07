@@ -9,12 +9,15 @@ layout(std140, set = 0, binding = 0) uniform SceneUniforms {
     uint point_light_count;
     uint spot_light_count;
 } scene;
-layout(push_constant) uniform PushConsts {
+layout(std140, set = 1, binding = 0) uniform ModelUniform {
     mat4 model;
-    vec4 color;
-} push;
+    vec4 albedo;
+    vec4 specular;
+    vec4 emission;
+    ivec4 maps;
+} model_data;
 layout(location = 0) out vec4 out_color;
 void main() {
-    out_color = push.color;
-    gl_Position = scene.view_proj * push.model * vec4(in_position, 1.0);
+    out_color = model_data.albedo;
+    gl_Position = scene.view_proj * model_data.model * vec4(in_position, 1.0);
 }
