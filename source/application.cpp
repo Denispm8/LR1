@@ -34,6 +34,15 @@ namespace {
         glm::vec2 uv;
     };
 
+    struct SimpleVertex {
+        glm::vec3 position;
+    };
+
+    struct PushConstantsUnlit {
+        glm::mat4 model;
+        glm::vec4 color;
+    };
+
     VkShaderModule loadShaderModule(const char* path) {
         std::string final_path = path;
         std::ifstream file(final_path, std::ios::binary | std::ios::ate);
@@ -58,7 +67,6 @@ namespace {
 
         const size_t size = static_cast<size_t>(file.tellg());
         std::vector<char> buffer(size);
-
         file.seekg(0);
         file.read(buffer.data(), size);
         file.close();
@@ -86,14 +94,23 @@ namespace application {
     namespace {
 
         constexpr uint32_t MAX_LIGHTS = 32;
-        constexpr uint32_t cube_count = 3;
-        constexpr uint32_t material_count = 3;
+        constexpr uint32_t cube_count = 4; 
+        constexpr uint32_t material_count = 4;
         constexpr uint32_t model_capacity = cube_count + 4 * MAX_LIGHTS;
+        constexpr uint32_t SHADOW_MAP_SIZE = 2048;
 
-        const char* material_names[] = { "Chain portrait", "Wide portrait", "Suit portrait" };
+        const char* material_names[] = { "Artemka", "Queen", "Cucumbers", "Volodka" };
         texture_resources::Texture albedo_textures[material_count];
         texture_resources::Texture specular_texture, black_texture;
+        texture_resources::Texture emissive_texture;
         VkSampler vk_texture_sampler = VK_NULL_HANDLE;
+
+        // ресурсики карты теней
+        VkImage vk_shadow_image = VK_NULL_HANDLE;
+        VmaAllocation vk_shadow_image_allocation = VK_NULL_HANDLE;
+        VkImageView vk_shadow_image_view = VK_NULL_HANDLE;
+        VkSampler vk_shadow_sampler = VK_NULL_HANDLE;
+        VkFormat shadow_depth_format = VK_FORMAT_D32_SFLOAT;
 
         float controlsWidth() {
             return std::min(390.0f, ImGui::GetIO().DisplaySize.x * 0.42f);
@@ -129,7 +146,6 @@ namespace application {
             addFace({ 0,-1, 0 }, { 1, 0, 0 }, { 0, 0, 1 });
 
             assert(v.size() == 24);
-
             return v;
         }
 
@@ -161,13 +177,15 @@ namespace application {
 
         struct SceneUniforms {
             glm::mat4 view_proj;
+            glm::mat4 shadow_view_proj;
             glm::vec4 camera_position;
             glm::vec4 directional_light_direction;
             glm::vec4 directional_light_color;
             glm::vec4 ambient_light;
             uint32_t point_light_count;
             uint32_t spot_light_count;
-            float _pad[2];
+            int32_t shadow_source_type; // 0 = солнышко, 1 = прожектор
+            float _pad;
         };
 
         struct GPUSpotLight {
@@ -195,11 +213,6 @@ namespace application {
             float color_modulation;
             int32_t effect;
         };
-        static_assert(sizeof(ModelUniform) == 128);
-        static_assert(offsetof(ModelUniform, emission) == 96);
-        static_assert(offsetof(ModelUniform, maps) == 112);
-        static_assert(sizeof(TexturePushConstants) == 16);
-        static_assert(offsetof(TexturePushConstants, effect) == 12);
 
         struct PointLightData {
             glm::vec3 position{ 0.0f, 2.5f, 0.0f };
@@ -208,12 +221,12 @@ namespace application {
         };
 
         struct SpotLightData {
-            glm::vec3 position{ 0.0f, 3.5f, 2.0f };
-            glm::vec3 direction{ 0.0f, -1.0f, -0.6f };
+            glm::vec3 position{ -3.0f, 4.0f, 2.0f };
+            glm::vec3 direction{ 0.6f, -1.0f, -0.4f };
             glm::vec3 color{ 0.3f, 0.7f, 1.0f };
-            float intensity = 15.0f;
-            float inner_angle_deg = 15.0f;
-            float outer_angle_deg = 25.0f;
+            float intensity = 20.0f;
+            float inner_angle_deg = 20.0f;
+            float outer_angle_deg = 35.0f;
         };
 
         void clampSpotAngles(SpotLightData& light) {
@@ -229,6 +242,10 @@ namespace application {
         VmaAllocation vk_scene_uniform_buffer_allocation = VK_NULL_HANDLE;
         SceneUniforms* vk_scene_uniform_buffer_mapped = nullptr;
 
+        VkBuffer vk_shadow_scene_buffer = VK_NULL_HANDLE;
+        VmaAllocation vk_shadow_scene_buffer_allocation = VK_NULL_HANDLE;
+        glm::mat4* vk_shadow_scene_buffer_mapped = nullptr;
+
         VkBuffer vk_point_ssbo = VK_NULL_HANDLE;
         VmaAllocation vk_point_ssbo_allocation = VK_NULL_HANDLE;
         GPUPointLight* vk_point_ssbo_mapped = nullptr;
@@ -243,22 +260,27 @@ namespace application {
         VkDeviceSize model_uniform_stride = 0;
 
         VkDescriptorSetLayout vk_scene_descriptor_set_layout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout vk_shadow_scene_descriptor_set_layout = VK_NULL_HANDLE;
         VkDescriptorSetLayout vk_model_descriptor_set_layout = VK_NULL_HANDLE;
         VkDescriptorPool vk_descriptor_pool = VK_NULL_HANDLE;
 
         VkDescriptorSet vk_scene_descriptor_set = VK_NULL_HANDLE;
+        VkDescriptorSet vk_shadow_scene_descriptor_set = VK_NULL_HANDLE;
         VkDescriptorSet vk_material_descriptor_sets[material_count] = {};
 
         VkPipelineLayout vk_pipeline_layout = VK_NULL_HANDLE;
+        VkPipelineLayout vk_shadow_pipeline_layout = VK_NULL_HANDLE;
         VkPipeline vk_pipeline = VK_NULL_HANDLE;
+        VkPipeline vk_shadow_pipeline = VK_NULL_HANDLE;
 
         VkPipeline vk_unlit_pipeline = VK_NULL_HANDLE;
         VkPipeline vk_unlit_lines_pipeline = VK_NULL_HANDLE;
 
         const glm::vec3 cube_offsets[cube_count] = {
-            { -3.0f, 0.0f, 0.0f },
-            {  0.0f, 0.0f, 0.0f },
-            {  3.0f, 0.0f, 0.0f },
+            { -2.5f, 0.0f,  0.0f },
+            {  0.0f, 0.0f,  0.0f },
+            {  2.5f, 0.0f,  0.0f },
+            {  0.0f,-1.5f,  0.0f }, 
         };
 
         struct CubeSettings {
@@ -281,25 +303,31 @@ namespace application {
         };
 
         CubeSettings cube_settings[cube_count] = {
-            { glm::vec3(0.0f), glm::vec3(-8.0f, 18.0f, 0.0f), glm::vec3(0.9f), glm::vec3(1.0f), glm::vec3(0.35f), 32.0f,  true, 0.0f, 0 },
-            { glm::vec3(0.0f), glm::vec3(-8.0f, -12.0f, 0.0f), glm::vec3(0.9f), glm::vec3(1.0f), glm::vec3(0.35f), 64.0f,  true, 2.094f, 1 },
-            { glm::vec3(0.0f), glm::vec3(-8.0f, -22.0f, 0.0f), glm::vec3(0.9f), glm::vec3(1.0f), glm::vec3(0.35f), 128.0f, true, 4.188f, 2 }
+            { glm::vec3(0.0f), glm::vec3(-8.0f, 18.0f, 0.0f), glm::vec3(0.8f), glm::vec3(1.0f), glm::vec3(0.35f), 32.0f,  true, 0.0f, 0 },
+            { glm::vec3(0.0f), glm::vec3(-8.0f, -12.0f, 0.0f), glm::vec3(0.8f), glm::vec3(1.0f), glm::vec3(0.35f), 64.0f,  true, 2.094f, 1 },
+            { glm::vec3(0.0f), glm::vec3(-8.0f, -22.0f, 0.0f), glm::vec3(0.8f), glm::vec3(1.0f), glm::vec3(0.35f), 128.0f, true, 4.188f, 2 },
+            { glm::vec3(0.0f), glm::vec3(0.0f), glm::vec3(10.0f, 0.05f, 10.0f), glm::vec3(0.7f), glm::vec3(0.1f), 16.0f, false, 0.0f, 3, 0, 0.0f, 0.0f, false, false, glm::vec3(0.0f), 0.0f }
         };
 
         struct Camera {
-            glm::vec3 position{ 0.0f, 2.0f, 9.0f };
+            glm::vec3 position{ 0.0f, 3.5f, 10.0f };
             float yaw = -90.0f;
-            float pitch = -10.0f;
+            float pitch = -15.0f;
             float fov = 45.0f;
         } camera;
 
-        glm::vec3 dir_light_direction = glm::normalize(glm::vec3(-0.5f, -1.0f, -0.3f));
-        glm::vec3 dir_light_color = glm::vec3(0.9f, 0.9f, 0.9f);
+        glm::vec3 dir_light_direction = glm::normalize(glm::vec3(-0.6f, -1.0f, -0.4f));
+        glm::vec3 dir_light_color = glm::vec3(1.0f, 0.98f, 0.95f);
         float dir_light_intensity = 1.0f;
-        glm::vec3 ambient_light_color = glm::vec3(0.22f, 0.22f, 0.25f);
-        bool show_light_visualizers = false;
+        glm::vec3 ambient_light_color = glm::vec3(0.2f, 0.2f, 0.25f);
+        bool show_light_visualizers = true;
         bool animate_texture = true;
         float texture_time = 0.0f;
+
+        float shadow_ortho_size = 7.0f;
+        float depth_bias_constant = 1.5f;
+        float depth_bias_slope = 2.0f;
+        int shadow_source = 0; 
 
         bool createBuffers() {
             auto vertices = generateCubeVertices();
@@ -327,7 +355,22 @@ namespace application {
                 vk_scene_uniform_buffer_mapped = static_cast<SceneUniforms*>(res.pMappedData);
             }
 
-            // Point Lights SSBO
+            {
+                VkBufferCreateInfo buf_info = {
+                    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                    .size = sizeof(glm::mat4),
+                    .usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                    .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                };
+                VmaAllocationCreateInfo alloc_info = {
+                    .flags = VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
+                    .usage = VMA_MEMORY_USAGE_AUTO,
+                };
+                VmaAllocationInfo res{};
+                if (vmaCreateBuffer(graphics::internal::context.allocator, &buf_info, &alloc_info, &vk_shadow_scene_buffer, &vk_shadow_scene_buffer_allocation, &res) != VK_SUCCESS) return false;
+                vk_shadow_scene_buffer_mapped = static_cast<glm::mat4*>(res.pMappedData);
+            }
+
             {
                 VkBufferCreateInfo buf_info = {
                     .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -344,7 +387,6 @@ namespace application {
                 vk_point_ssbo_mapped = static_cast<GPUPointLight*>(res.pMappedData);
             }
 
-            // Spot Lights SSBO
             {
                 VkBufferCreateInfo buf_info = {
                     .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -366,7 +408,6 @@ namespace application {
                 vkGetPhysicalDeviceProperties(graphics::internal::context.physical_device, &properties);
                 const VkDeviceSize alignment = properties.limits.minUniformBufferOffsetAlignment;
                 model_uniform_stride = (sizeof(ModelUniform) + alignment - 1) & ~(alignment - 1);
-                assert(model_uniform_stride % alignment == 0);
                 const VkBufferCreateInfo buf_info = {
                     .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                     .size = model_uniform_stride * model_capacity,
@@ -404,17 +445,81 @@ namespace application {
             return true;
         }
 
+        bool createShadowResources() {
+            auto& device = graphics::internal::context.device;
+            auto& allocator = graphics::internal::context.allocator;
+
+            const VkImageCreateInfo image_info = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = shadow_depth_format,
+                .extent = { SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 1 },
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            };
+
+            const VmaAllocationCreateInfo alloc_info = {
+                .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            };
+
+            if (vmaCreateImage(allocator, &image_info, &alloc_info,
+                &vk_shadow_image, &vk_shadow_image_allocation, nullptr) != VK_SUCCESS) return false;
+
+            const VkImageViewCreateInfo view_info = {
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .image = vk_shadow_image,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                .format = shadow_depth_format,
+                .subresourceRange = {
+                    .aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT,
+                    .baseMipLevel = 0,
+                    .levelCount = 1,
+                    .baseArrayLayer = 0,
+                    .layerCount = 1,
+                },
+            };
+
+            if (vkCreateImageView(device, &view_info, nullptr, &vk_shadow_image_view) != VK_SUCCESS) return false;
+
+            const VkSamplerCreateInfo sampler_info = {
+                .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                .magFilter = VK_FILTER_LINEAR,
+                .minFilter = VK_FILTER_LINEAR,
+                .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+                .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
+                .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                .compareEnable = VK_TRUE,
+                .compareOp = VK_COMPARE_OP_LESS_OR_EQUAL,
+                .borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE, 
+            };
+
+            return vkCreateSampler(device, &sampler_info, nullptr, &vk_shadow_sampler) == VK_SUCCESS;
+        }
+
         bool createTextures() {
             const char* paths[] = {
-                "assets/textures/portrait_chain.png",
-                "assets/textures/portrait_wide.png",
-                "assets/textures/portrait_suit.png",
+                "assets/textures/Артёмка.png",
+                "assets/textures/Царица.png",
+                "assets/textures/Огуречки.png",
+                "assets/textures/Володька.png",
             };
+
             for (uint32_t i = 0; i < material_count; ++i) {
                 if (!texture_resources::loadTexture(paths[i], VK_FORMAT_R8G8B8A8_SRGB, albedo_textures[i])) return false;
             }
+
             if (!texture_resources::loadTexture("assets/textures/specular_grid.png", VK_FORMAT_R8G8B8A8_UNORM, specular_texture) ||
-                !texture_resources::loadTexture("assets/textures/black.png", VK_FORMAT_R8G8B8A8_UNORM, black_texture)) return false;
+                !texture_resources::loadTexture("assets/textures/black.png", VK_FORMAT_R8G8B8A8_UNORM, black_texture) ||
+                !texture_resources::loadTexture("assets/textures/emissive_map.png", VK_FORMAT_R8G8B8A8_UNORM, emissive_texture))
+                return false;
+
             const VkSamplerCreateInfo sampler_info = {
                 .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
                 .magFilter = VK_FILTER_LINEAR,
@@ -431,33 +536,44 @@ namespace application {
         bool createDescriptors() {
             auto& device = graphics::internal::context.device;
 
+            // set 0: scene UBO + point SSBO + spot SSBO + shadow map sampler
             const VkDescriptorSetLayoutBinding scene_bindings[] = {
                 {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT },
                 {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
                 {.binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+                {.binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
             };
 
             const VkDescriptorSetLayoutCreateInfo scene_layout_info = {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-                .bindingCount = 3,
+                .bindingCount = 4,
                 .pBindings = scene_bindings,
             };
-
             if (vkCreateDescriptorSetLayout(device, &scene_layout_info, nullptr, &vk_scene_descriptor_set_layout) != VK_SUCCESS) return false;
 
+            // set 0 для прохода тени
+            const VkDescriptorSetLayoutBinding shadow_scene_binding = {
+                .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_VERTEX_BIT
+            };
+            const VkDescriptorSetLayoutCreateInfo shadow_scene_layout_info = {
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                .bindingCount = 1,
+                .pBindings = &shadow_scene_binding,
+            };
+            if (vkCreateDescriptorSetLayout(device, &shadow_scene_layout_info, nullptr, &vk_shadow_scene_descriptor_set_layout) != VK_SUCCESS) return false;
+
             const VkDescriptorSetLayoutBinding model_bindings[] = {
-                { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .descriptorCount = 1,
+                {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .descriptorCount = 1,
                   .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT },
-                { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-                { .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
-                { .binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+                {.binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+                {.binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+                {.binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
             };
             const VkDescriptorSetLayoutCreateInfo model_layout_info = {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                 .bindingCount = 4,
                 .pBindings = model_bindings,
             };
-
             if (vkCreateDescriptorSetLayout(device, &model_layout_info, nullptr, &vk_model_descriptor_set_layout) != VK_SUCCESS) return false;
 
             const VkDescriptorSetLayout set_layouts[] = { vk_scene_descriptor_set_layout, vk_model_descriptor_set_layout };
@@ -473,23 +589,30 @@ namespace application {
                 .pushConstantRangeCount = 1,
                 .pPushConstantRanges = &texture_push_range,
             };
-
             if (vkCreatePipelineLayout(device, &pipeline_layout_info, nullptr, &vk_pipeline_layout) != VK_SUCCESS) return false;
 
+            // pipeline layout для тени
+            const VkDescriptorSetLayout shadow_set_layouts[] = { vk_shadow_scene_descriptor_set_layout, vk_model_descriptor_set_layout };
+            const VkPipelineLayoutCreateInfo shadow_pipeline_layout_info = {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                .setLayoutCount = 2,
+                .pSetLayouts = shadow_set_layouts,
+            };
+            if (vkCreatePipelineLayout(device, &shadow_pipeline_layout_info, nullptr, &vk_shadow_pipeline_layout) != VK_SUCCESS) return false;
+
             const VkDescriptorPoolSize pool_sizes[] = {
-                {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1 },
+                {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 2 },
                 {.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .descriptorCount = material_count },
-                {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 3 * material_count },
+                {.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 3 * material_count + 1 },
                 {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 2 },
             };
 
             const VkDescriptorPoolCreateInfo pool_info = {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                .maxSets = 1 + material_count,
+                .maxSets = 2 + material_count,
                 .poolSizeCount = 4,
                 .pPoolSizes = pool_sizes,
             };
-
             if (vkCreateDescriptorPool(device, &pool_info, nullptr, &vk_descriptor_pool) != VK_SUCCESS) return false;
 
             const VkDescriptorSetAllocateInfo scene_alloc = {
@@ -500,16 +623,38 @@ namespace application {
             };
             if (vkAllocateDescriptorSets(device, &scene_alloc, &vk_scene_descriptor_set) != VK_SUCCESS) return false;
 
+            // shadow scene set
+            const VkDescriptorSetAllocateInfo shadow_scene_alloc = {
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                .descriptorPool = vk_descriptor_pool,
+                .descriptorSetCount = 1,
+                .pSetLayouts = &vk_shadow_scene_descriptor_set_layout,
+            };
+            if (vkAllocateDescriptorSets(device, &shadow_scene_alloc, &vk_shadow_scene_descriptor_set) != VK_SUCCESS) return false;
+
             VkDescriptorBufferInfo scene_ubo_info = { .buffer = vk_scene_uniform_buffer, .offset = 0, .range = sizeof(SceneUniforms) };
             VkDescriptorBufferInfo point_ssbo_info = { .buffer = vk_point_ssbo, .offset = 0, .range = sizeof(GPUPointLight) * MAX_LIGHTS };
             VkDescriptorBufferInfo spot_ssbo_info = { .buffer = vk_spot_ssbo, .offset = 0, .range = sizeof(GPUSpotLight) * MAX_LIGHTS };
+            VkDescriptorImageInfo shadow_image_info = { .sampler = vk_shadow_sampler, .imageView = vk_shadow_image_view, .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
 
             const VkWriteDescriptorSet scene_writes[] = {
                 {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = vk_scene_descriptor_set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &scene_ubo_info },
                 {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = vk_scene_descriptor_set, .dstBinding = 1, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &point_ssbo_info },
                 {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = vk_scene_descriptor_set, .dstBinding = 2, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &spot_ssbo_info },
+                {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = vk_scene_descriptor_set, .dstBinding = 3, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &shadow_image_info },
             };
-            vkUpdateDescriptorSets(device, 3, scene_writes, 0, nullptr);
+            vkUpdateDescriptorSets(device, 4, scene_writes, 0, nullptr);
+
+            VkDescriptorBufferInfo shadow_scene_ubo_info = { .buffer = vk_shadow_scene_buffer, .offset = 0, .range = sizeof(glm::mat4) };
+            const VkWriteDescriptorSet shadow_scene_write = {
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = vk_shadow_scene_descriptor_set,
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                .pBufferInfo = &shadow_scene_ubo_info
+            };
+            vkUpdateDescriptorSets(device, 1, &shadow_scene_write, 0, nullptr);
 
             for (uint32_t i = 0; i < material_count; ++i) {
                 const VkDescriptorSetAllocateInfo model_alloc = {
@@ -524,16 +669,16 @@ namespace application {
                 const VkDescriptorImageInfo images[] = {
                     { vk_texture_sampler, albedo_textures[i].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
                     { vk_texture_sampler, specular_texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
-                    { vk_texture_sampler, i == 0 ? black_texture.view : albedo_textures[i].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+                    { vk_texture_sampler, i == 0 ? black_texture.view : emissive_texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
                 };
                 const VkWriteDescriptorSet writes[] = {
-                    { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = vk_material_descriptor_sets[i], .dstBinding = 0,
+                    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = vk_material_descriptor_sets[i], .dstBinding = 0,
                       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, .pBufferInfo = &model_info },
-                    { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = vk_material_descriptor_sets[i], .dstBinding = 1,
+                    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = vk_material_descriptor_sets[i], .dstBinding = 1,
                       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &images[0] },
-                    { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = vk_material_descriptor_sets[i], .dstBinding = 2,
+                    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = vk_material_descriptor_sets[i], .dstBinding = 2,
                       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &images[1] },
-                    { .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = vk_material_descriptor_sets[i], .dstBinding = 3,
+                    {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = vk_material_descriptor_sets[i], .dstBinding = 3,
                       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &images[2] },
                 };
                 vkUpdateDescriptorSets(device, 4, writes, 0, nullptr);
@@ -550,6 +695,7 @@ namespace application {
             vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS,
                 vk_pipeline_layout, 1, 1, &vk_material_descriptor_sets[0], 1, &dynamic_offset);
         }
+
 
         bool createPipelines() {
             auto& device = graphics::internal::context.device;
@@ -572,7 +718,7 @@ namespace application {
             const VkVertexInputAttributeDescription vertex_attributes[] = {
                 {.location = 0, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = offsetof(Vertex, position) },
                 {.location = 1, .binding = 0, .format = VK_FORMAT_R32G32B32_SFLOAT, .offset = offsetof(Vertex, normal) },
-                {.location = 2, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT, .offset = offsetof(Vertex, uv) },
+                {.location = 2, .binding = 0, .format = VK_FORMAT_R32G32_SFLOAT,    .offset = offsetof(Vertex, uv) },
             };
 
             const VkPipelineVertexInputStateCreateInfo vertex_input = {
@@ -652,6 +798,59 @@ namespace application {
             vkDestroyShaderModule(device, vert_m, nullptr);
             vkDestroyShaderModule(device, frag_m, nullptr);
 
+            // pipelaine map shadow (dynamic rendering, depth only) 
+            VkShaderModule shadow_vert_m = loadShaderModule("shaders/shadow.vert.spv");
+            if (!shadow_vert_m) return false;
+
+            const VkPipelineShaderStageCreateInfo shadow_stage = {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                .stage = VK_SHADER_STAGE_VERTEX_BIT,
+                .module = shadow_vert_m,
+                .pName = "main"
+            };
+
+            // описание форматов для динамического рендеринга 
+            const VkPipelineRenderingCreateInfoKHR shadow_render_info = {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR,
+                .colorAttachmentCount = 0, 
+                .depthAttachmentFormat = shadow_depth_format,
+            };
+
+            // растеризация с включенным Depth Bias
+            VkPipelineRasterizationStateCreateInfo shadow_raster = rasterization;
+            shadow_raster.cullMode = VK_CULL_MODE_NONE;
+            shadow_raster.depthBiasEnable = VK_TRUE;
+
+            const VkDynamicState shadow_dyn_states[] = {
+                VK_DYNAMIC_STATE_VIEWPORT,
+                VK_DYNAMIC_STATE_SCISSOR,
+                VK_DYNAMIC_STATE_DEPTH_BIAS 
+            };
+            const VkPipelineDynamicStateCreateInfo shadow_dyn_state = {
+                .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+                .dynamicStateCount = 3,
+                .pDynamicStates = shadow_dyn_states,
+            };
+
+            const VkGraphicsPipelineCreateInfo shadow_pipeline_info = {
+                .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+                .pNext = &shadow_render_info, 
+                .stageCount = 1, 
+                .pStages = &shadow_stage,
+                .pVertexInputState = &vertex_input,
+                .pInputAssemblyState = &input_assembly,
+                .pViewportState = &viewport_state,
+                .pRasterizationState = &shadow_raster,
+                .pMultisampleState = &multisample,
+                .pDepthStencilState = &depth_stencil,
+                .pDynamicState = &shadow_dyn_state,
+                .layout = vk_shadow_pipeline_layout,
+                .renderPass = VK_NULL_HANDLE, 
+            };
+
+            if (vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &shadow_pipeline_info, nullptr, &vk_shadow_pipeline) != VK_SUCCESS) return false;
+            vkDestroyShaderModule(device, shadow_vert_m, nullptr);
+
             VkShaderModule unlit_vert_m = loadShaderModule("shaders/unlit.vert.spv");
             VkShaderModule unlit_frag_m = loadShaderModule("shaders/unlit.frag.spv");
             if (!unlit_vert_m || !unlit_frag_m) return false;
@@ -708,54 +907,14 @@ namespace application {
     } // namespace
 
     bool initialize() {
-#ifndef NDEBUG
-        for (float inner : { -100.0f, 1.0f, 15.0f, 40.0f, 60.0f, 200.0f }) {
-            for (float outer : { -100.0f, 1.1f, 15.0f, 25.0f, 80.0f, 200.0f }) {
-                SpotLightData sample;
-                sample.inner_angle_deg = inner;
-                sample.outer_angle_deg = outer;
-                clampSpotAngles(sample);
-                assert(sample.inner_angle_deg >= 1.0f && sample.inner_angle_deg <= 60.0f);
-                assert(sample.outer_angle_deg <= 80.0f && sample.inner_angle_deg < sample.outer_angle_deg);
-                assert(std::cos(glm::radians(sample.inner_angle_deg)) > std::cos(glm::radians(sample.outer_angle_deg)));
-                assert(std::tan(glm::radians(sample.inner_angle_deg)) < std::tan(glm::radians(sample.outer_angle_deg)));
-            }
-        }
-#endif
-        ImGui::StyleColorsDark();
-        auto& style = ImGui::GetStyle();
-        style.WindowPadding = ImVec2(16.0f, 14.0f);
-        style.FramePadding = ImVec2(6.0f, 5.0f);
-        style.ItemSpacing = ImVec2(8.0f, 8.0f);
-        style.FrameRounding = 4.0f;
-        style.GrabRounding = 4.0f;
-        style.Colors[ImGuiCol_WindowBg] = ImVec4(0.055f, 0.065f, 0.09f, 1.0f);
-        style.Colors[ImGuiCol_Header] = ImVec4(0.13f, 0.25f, 0.31f, 1.0f);
-        style.Colors[ImGuiCol_Button] = ImVec4(0.10f, 0.32f, 0.37f, 1.0f);
-        style.Colors[ImGuiCol_CheckMark] = ImVec4(0.32f, 0.85f, 0.76f, 1.0f);
-        style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.32f, 0.85f, 0.76f, 1.0f);
         point_lights.push_back({ { 0.0f, 2.5f, 0.0f }, { 1.0f, 0.9f, 0.7f }, 6.0f });
-        spot_lights.push_back({ { -3.0f, 3.5f, 2.0f }, glm::normalize(glm::vec3(0.5f, -1.0f, -0.5f)), { 0.3f, 0.7f, 1.0f }, 15.0f, 15.0f, 25.0f });
+        spot_lights.push_back({ { -3.0f, 4.0f, 2.0f }, glm::normalize(glm::vec3(0.6f, -1.0f, -0.4f)), { 0.3f, 0.7f, 1.0f }, 20.0f, 20.0f, 35.0f });
 
-        if (!createBuffers()) {
-            MessageBoxA(nullptr, "createBuffers() failed! Check VMA allocations.", "Init Error", MB_ICONERROR | MB_OK);
-            return false;
-        }
-
-        if (!createTextures()) {
-            MessageBoxA(nullptr, "Cannot load textures. Run the application from the project root (assets/textures).", "Texture Load Error", MB_ICONERROR | MB_OK);
-            return false;
-        }
-
-        if (!createDescriptors()) {
-            MessageBoxA(nullptr, "createDescriptors() failed! Check descriptor layouts/pool.", "Init Error", MB_ICONERROR | MB_OK);
-            return false;
-        }
-
-        if (!createPipelines()) {
-            MessageBoxA(nullptr, "createPipelines() failed! Check shader compilation.", "Init Error", MB_ICONERROR | MB_OK);
-            return false;
-        }
+        if (!createBuffers()) return false;
+        if (!createShadowResources()) return false;
+        if (!createTextures()) return false;
+        if (!createDescriptors()) return false;
+        if (!createPipelines()) return false;
 
         return true;
     }
@@ -764,25 +923,36 @@ namespace application {
         auto& context = graphics::internal::context;
         vkDeviceWaitIdle(context.device);
 
-        if (vk_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(context.device, vk_pipeline, nullptr);
         if (vk_unlit_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(context.device, vk_unlit_pipeline, nullptr);
         if (vk_unlit_lines_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(context.device, vk_unlit_lines_pipeline, nullptr);
 
+        if (vk_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(context.device, vk_pipeline, nullptr);
+        if (vk_shadow_pipeline != VK_NULL_HANDLE) vkDestroyPipeline(context.device, vk_shadow_pipeline, nullptr);
+
         if (vk_pipeline_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(context.device, vk_pipeline_layout, nullptr);
+        if (vk_shadow_pipeline_layout != VK_NULL_HANDLE) vkDestroyPipelineLayout(context.device, vk_shadow_pipeline_layout, nullptr);
 
         if (vk_descriptor_pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(context.device, vk_descriptor_pool, nullptr);
         if (vk_scene_descriptor_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(context.device, vk_scene_descriptor_set_layout, nullptr);
+        if (vk_shadow_scene_descriptor_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(context.device, vk_shadow_scene_descriptor_set_layout, nullptr);
         if (vk_model_descriptor_set_layout != VK_NULL_HANDLE) vkDestroyDescriptorSetLayout(context.device, vk_model_descriptor_set_layout, nullptr);
 
+        if (vk_shadow_sampler != VK_NULL_HANDLE) vkDestroySampler(context.device, vk_shadow_sampler, nullptr);
+        if (vk_shadow_image_view != VK_NULL_HANDLE) vkDestroyImageView(context.device, vk_shadow_image_view, nullptr);
+        if (vk_shadow_image != VK_NULL_HANDLE) vmaDestroyImage(context.allocator, vk_shadow_image, vk_shadow_image_allocation);
+
         if (vk_scene_uniform_buffer != VK_NULL_HANDLE) vmaDestroyBuffer(context.allocator, vk_scene_uniform_buffer, vk_scene_uniform_buffer_allocation);
+        if (vk_shadow_scene_buffer != VK_NULL_HANDLE) vmaDestroyBuffer(context.allocator, vk_shadow_scene_buffer, vk_shadow_scene_buffer_allocation);
         if (vk_point_ssbo != VK_NULL_HANDLE) vmaDestroyBuffer(context.allocator, vk_point_ssbo, vk_point_ssbo_allocation);
         if (vk_spot_ssbo != VK_NULL_HANDLE) vmaDestroyBuffer(context.allocator, vk_spot_ssbo, vk_spot_ssbo_allocation);
-
         if (vk_model_uniform_buffer) vmaDestroyBuffer(context.allocator, vk_model_uniform_buffer, vk_model_uniform_buffer_allocation);
+
         if (vk_texture_sampler) vkDestroySampler(context.device, vk_texture_sampler, nullptr);
         for (auto& texture : albedo_textures) texture_resources::destroyTexture(texture);
         texture_resources::destroyTexture(specular_texture);
         texture_resources::destroyTexture(black_texture);
+        texture_resources::destroyTexture(emissive_texture);
+
         if (vk_vertex_buffer != VK_NULL_HANDLE) vmaDestroyBuffer(context.allocator, vk_vertex_buffer, vk_vertex_buffer_allocation);
         if (vk_index_buffer != VK_NULL_HANDLE) vmaDestroyBuffer(context.allocator, vk_index_buffer, vk_index_buffer_allocation);
         if (vk_cone_vertex_buffer != VK_NULL_HANDLE) vmaDestroyBuffer(context.allocator, vk_cone_vertex_buffer, vk_cone_vertex_buffer_allocation);
@@ -793,7 +963,7 @@ namespace application {
         const float aspect = float(sceneWidth()) / float(extent.height);
 
         static int projection_mode = 0;
-        static bool is_playing = false;
+        static bool is_playing = true;
         static float anim_speed = 1.0f;
         static float anim_radius = 1.5f;
         static float anim_height = 0.5f;
@@ -811,17 +981,30 @@ namespace application {
         }
 
         if (animate_texture) texture_time += float(delta);
+
         const auto display = ImGui::GetIO().DisplaySize;
-        ImGui::SetNextWindowPos(ImVec2(display.x - controlsWidth(), 0.0f));
+        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
         ImGui::SetNextWindowSize(ImVec2(controlsWidth(), display.y));
-        ImGui::Begin("Texture studio", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
+        ImGui::Begin("Studio Controls", nullptr, ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings);
+
         ImGui::Separator();
+
+        if (ImGui::CollapsingHeader("Shadow Map Settings", ImGuiTreeNodeFlags_DefaultOpen)) {
+            ImGui::Text("Shadow Source:");
+            ImGui::RadioButton("Sun", &shadow_source, 0);
+            ImGui::SameLine();
+            ImGui::RadioButton("Spot Light", &shadow_source, 1);
+
+            ImGui::SliderFloat("Ortho Size", &shadow_ortho_size, 2.0f, 20.0f, "%.1f");
+            ImGui::SliderFloat("Depth Bias Const", &depth_bias_constant, 0.0f, 5.0f, "%.2f");
+            ImGui::SliderFloat("Depth Bias Slope", &depth_bias_slope, 0.0f, 5.0f, "%.2f");
+        }
 
         static int selected_cube = 0;
         if (ImGui::BeginTabBar("Cubes")) {
             for (int i = 0; i < int(cube_count); ++i) {
-                const std::string label = "Cube " + std::to_string(i + 1);
+                const std::string label = (i == 3) ? "Floor (Plane)" : ("Cube " + std::to_string(i + 1));
                 if (ImGui::BeginTabItem(label.c_str())) {
                     selected_cube = i;
                     ImGui::EndTabItem();
@@ -829,6 +1012,7 @@ namespace application {
             }
             ImGui::EndTabBar();
         }
+
         auto& selected = cube_settings[selected_cube];
         ImGui::Combo("Texture", &selected.material, material_names, material_count);
         ImGui::Combo("Sampling", &selected.effect, "Original\0Waves + RGB split\0");
@@ -837,29 +1021,33 @@ namespace application {
             ImGui::SliderFloat("Color modulation", &selected.color_modulation, 0.0f, 1.0f);
         }
         ImGui::Checkbox("Animate textures", &animate_texture);
+
         if (ImGui::CollapsingHeader("Material maps", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::ColorEdit3("Albedo tint", &selected.albedo.x);
             ImGui::Checkbox("Specular map", &selected.specular_map);
             ImGui::ColorEdit3("Specular tint", &selected.specular.x);
             ImGui::SliderFloat("Shininess", &selected.shininess, 1.0f, 256.0f);
+
             ImGui::BeginDisabled(selected.material == 0);
             ImGui::Checkbox("Emissive map", &selected.emissive_map);
             ImGui::SliderFloat("Emission", &selected.emission_strength, 0.0f, 3.0f);
             ImGui::ColorEdit3("Emission tint", &selected.emission_tint.x);
             ImGui::EndDisabled();
-            if (selected.material == 0) ImGui::TextDisabled("No emission map for this material.");
+            if (selected.material == 0) ImGui::TextDisabled("No emission for this material (black fallback).");
         }
-        ImGui::Separator();
 
-        // Проекция
-        ImGui::Text("Projection:");
-        ImGui::RadioButton("Perspective", &projection_mode, 0);
-        ImGui::SameLine();
-        ImGui::RadioButton("Orthographic", &projection_mode, 1);
+        if (ImGui::CollapsingHeader("Transform & Animation")) {
+            ImGui::Checkbox("Animate this object", &selected.animate);
+            ImGui::SliderFloat3("Position", &selected.position.x, -15.0f, 15.0f);
+            ImGui::SliderFloat3("Rotation", &selected.rotationDeg.x, -180.0f, 180.0f);
+            ImGui::SliderFloat3("Scale", &selected.scale.x, 0.05f, 15.0f);
+        }
 
-        // Интерактивная камера 
-        if (ImGui::CollapsingHeader("Camera (View Matrix)")) {
-            ImGui::SliderFloat3("Position", &camera.position.x, -15.0f, 15.0f);
+        if (ImGui::CollapsingHeader("Projection & Camera")) {
+            ImGui::RadioButton("Perspective", &projection_mode, 0);
+            ImGui::SameLine();
+            ImGui::RadioButton("Orthographic", &projection_mode, 1);
+            ImGui::SliderFloat3("Camera Pos", &camera.position.x, -25.0f, 25.0f);
             ImGui::SliderFloat("Yaw", &camera.yaw, -180.0f, 180.0f);
             ImGui::SliderFloat("Pitch", &camera.pitch, -89.0f, 89.0f);
             ImGui::SliderFloat("FOV", &camera.fov, 15.0f, 110.0f);
@@ -868,25 +1056,24 @@ namespace application {
         if (ImGui::CollapsingHeader("Global Animation (Lissajous)")) {
             ImGui::Checkbox("Play animation", &is_playing);
             ImGui::SliderFloat("Speed", &anim_speed, -3.0f, 3.0f);
-            ImGui::SliderFloat("Radius", &anim_radius, 0.0f, 3.0f);
-            ImGui::SliderFloat("Height", &anim_height, -1.5f, 1.5f);
+            ImGui::SliderFloat("Radius", &anim_radius, 0.0f, 5.0f);
+            ImGui::SliderFloat("Height", &anim_height, -2.0f, 2.0f);
             ImGui::Text("Angle: %.2f rad", anim_angle);
         }
 
-        // Освещение сцены
         if (ImGui::CollapsingHeader("Lighting: Directional & Ambient")) {
-            ImGui::SliderFloat3("Direction", &dir_light_direction.x, -1.0f, 1.0f);
+            ImGui::SliderFloat3("Sun Direction", &dir_light_direction.x, -1.0f, 1.0f);
             if (glm::length(dir_light_direction) > 0.001f) dir_light_direction = glm::normalize(dir_light_direction);
             ImGui::ColorEdit3("Sun Color", &dir_light_color.x);
             ImGui::SliderFloat("Sun Intensity", &dir_light_intensity, 0.0f, 5.0f);
             ImGui::Separator();
             ImGui::ColorEdit3("Ambient Light", &ambient_light_color.x);
+            ImGui::Checkbox("Show Light Gizmos", &show_light_visualizers);
         }
 
-        // Массив точечных источников в SSBO
         if (ImGui::CollapsingHeader("Point Lights (SSBO Array)")) {
             if (ImGui::Button("+ Add Point Light") && point_lights.size() < MAX_LIGHTS) {
-                point_lights.push_back({ { 0.0f, 2.0f, 0.0f }, { 1.0f, 1.0f, 1.0f }, 5.0f });
+                point_lights.push_back({ { 0.0f, 3.0f, 0.0f }, { 1.0f, 1.0f, 1.0f }, 6.0f });
             }
             ImGui::SameLine();
             ImGui::Text("(Count: %zu)", point_lights.size());
@@ -895,9 +1082,9 @@ namespace application {
                 ImGui::PushID(static_cast<int>(i));
                 std::string title = "Point Light #" + std::to_string(i + 1);
                 if (ImGui::TreeNode(title.c_str())) {
-                    ImGui::SliderFloat3("Position", &point_lights[i].position.x, -10.0f, 10.0f);
+                    ImGui::SliderFloat3("Position", &point_lights[i].position.x, -15.0f, 15.0f);
                     ImGui::ColorEdit3("Color", &point_lights[i].color.x);
-                    ImGui::SliderFloat("Intensity", &point_lights[i].intensity, 0.1f, 30.0f);
+                    ImGui::SliderFloat("Intensity", &point_lights[i].intensity, 0.1f, 50.0f);
                     if (ImGui::Button("Delete")) {
                         point_lights.erase(point_lights.begin() + i);
                         ImGui::TreePop();
@@ -910,10 +1097,9 @@ namespace application {
             }
         }
 
-        // Массив прожекторных источников в SSBO
         if (ImGui::CollapsingHeader("Spot Lights (SSBO Array)")) {
             if (ImGui::Button("+ Add Spot Light") && spot_lights.size() < MAX_LIGHTS) {
-                spot_lights.push_back({ { 0.0f, 3.0f, 0.0f }, { 0.0f, -1.0f, 0.0f }, { 1.0f, 1.0f, 1.0f }, 10.0f, 15.0f, 25.0f });
+                spot_lights.push_back({ { -3.0f, 4.0f, 2.0f }, { 0.6f, -1.0f, -0.4f }, { 1.0f, 1.0f, 1.0f }, 20.0f, 20.0f, 35.0f });
             }
             ImGui::SameLine();
             ImGui::Text("(Count: %zu)", spot_lights.size());
@@ -922,19 +1108,18 @@ namespace application {
                 ImGui::PushID(static_cast<int>(100 + i));
                 std::string title = "Spot Light #" + std::to_string(i + 1);
                 if (ImGui::TreeNode(title.c_str())) {
-                    ImGui::SliderFloat3("Position", &spot_lights[i].position.x, -10.0f, 10.0f);
+                    ImGui::SliderFloat3("Position", &spot_lights[i].position.x, -15.0f, 15.0f);
                     ImGui::SliderFloat3("Direction", &spot_lights[i].direction.x, -1.0f, 1.0f);
                     if (glm::length(spot_lights[i].direction) > 0.001f) spot_lights[i].direction = glm::normalize(spot_lights[i].direction);
                     else spot_lights[i].direction = glm::vec3(0.0f, -1.0f, 0.0f);
                     ImGui::ColorEdit3("Color", &spot_lights[i].color.x);
-                    ImGui::SliderFloat("Intensity", &spot_lights[i].intensity, 0.1f, 50.0f);
+                    ImGui::SliderFloat("Intensity", &spot_lights[i].intensity, 0.1f, 80.0f);
                     auto& light = spot_lights[i];
                     ImGui::SliderFloat("Inner Angle", &light.inner_angle_deg, 1.0f,
                         std::min(60.0f, light.outer_angle_deg - 0.1f), "%.1f deg", ImGuiSliderFlags_AlwaysClamp);
                     ImGui::SliderFloat("Outer Angle", &light.outer_angle_deg,
                         light.inner_angle_deg + 0.1f, 80.0f, "%.1f deg", ImGuiSliderFlags_AlwaysClamp);
                     clampSpotAngles(light);
-                    ImGui::TextDisabled("Inner cone stays inside the outer cone.");
                     if (ImGui::Button("Delete")) {
                         spot_lights.erase(spot_lights.begin() + i);
                         ImGui::TreePop();
@@ -947,82 +1132,64 @@ namespace application {
             }
         }
 
-        if (ImGui::CollapsingHeader("Objects: Transform, Anim & Materials")) {
-            for (uint32_t i = 0; i < cube_count; ++i) {
-                std::string label = "Cube #" + std::to_string(i + 1);
-                if (ImGui::TreeNode(label.c_str())) {
-                    CubeSettings& s = cube_settings[i];
-
-                    ImGui::Checkbox("Animate", &s.animate);
-                    ImGui::SliderFloat("Phase offset", &s.phaseOffset, -6.28f, 6.28f, "%.2f rad");
-
-                    ImGui::Separator();
-                    ImGui::SliderFloat3("Position", &s.position.x, -5.0f, 5.0f);
-                    ImGui::SliderFloat3("Rotation", &s.rotationDeg.x, -180.0f, 180.0f);
-                    ImGui::SliderFloat3("Scale", &s.scale.x, 0.1f, 3.0f);
-
-                    ImGui::Separator();
-                    ImGui::Text("Blinn-Phong Material:");
-                    ImGui::ColorEdit3("Albedo (Kd)", &s.albedo.x);
-                    ImGui::ColorEdit3("Specular (Ks)", &s.specular.x);
-                    ImGui::SliderFloat("Shininess (Alpha)", &s.shininess, 1.0f, 256.0f);
-
-                    ImGui::TreePop();
-                }
-            }
-        }
-
-        ImGui::Checkbox("Show Light Gizmos", &show_light_visualizers);
         ImGui::End();
 
-        // Расчет направления камеры и матрицы вида (View)
         glm::vec3 front;
         front.x = cos(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch));
         front.y = sin(glm::radians(camera.pitch));
         front.z = sin(glm::radians(camera.yaw)) * cos(glm::radians(camera.pitch));
         front = glm::normalize(front);
-
         glm::mat4 view = glm::lookAt(camera.position, camera.position + front, glm::vec3(0.0f, 1.0f, 0.0f));
 
-        // Расчет матрицы проекции (перспектива или ортографическая)
         glm::mat4 proj;
         if (projection_mode == 0) {
             proj = glm::perspective(glm::radians(camera.fov), aspect, 0.1f, 100.0f);
-        }
-        else {
+        } else {
             float ortho_size = 6.0f;
             proj = glm::ortho(-ortho_size * aspect, ortho_size * aspect, -ortho_size, ortho_size, 0.1f, 100.0f);
         }
         proj[1][1] *= -1.0f;
 
-        // Отправка общих данных сцены
+        glm::mat4 shadow_view;
+        glm::mat4 shadow_proj;
+
+        if (shadow_source == 0) {
+            glm::vec3 sun_pos = -dir_light_direction * 15.0f;
+            shadow_view = glm::lookAt(sun_pos, glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+            shadow_proj = glm::ortho(-shadow_ortho_size, shadow_ortho_size, -shadow_ortho_size, shadow_ortho_size, 0.1f, 40.0f);
+        } else {
+            auto& spot = spot_lights.empty() ? spot_lights.emplace_back() : spot_lights[0];
+            shadow_view = glm::lookAt(spot.position, spot.position + spot.direction, glm::vec3(0.0f, 1.0f, 0.0f));
+            shadow_proj = glm::perspective(glm::radians(spot.outer_angle_deg * 2.0f), 1.0f, 0.1f, 30.0f);
+        }
+        shadow_proj[1][1] *= -1.0f;
+        glm::mat4 shadow_view_proj = shadow_proj * shadow_view;
+
         vk_scene_uniform_buffer_mapped->view_proj = proj * view;
+        vk_scene_uniform_buffer_mapped->shadow_view_proj = shadow_view_proj;
         vk_scene_uniform_buffer_mapped->camera_position = glm::vec4(camera.position, 1.0f);
         vk_scene_uniform_buffer_mapped->directional_light_direction = glm::vec4(dir_light_direction, 0.0f);
         vk_scene_uniform_buffer_mapped->directional_light_color = glm::vec4(dir_light_color * dir_light_intensity, 1.0f);
         vk_scene_uniform_buffer_mapped->ambient_light = glm::vec4(ambient_light_color, 1.0f);
         vk_scene_uniform_buffer_mapped->point_light_count = static_cast<uint32_t>(point_lights.size());
         vk_scene_uniform_buffer_mapped->spot_light_count = static_cast<uint32_t>(spot_lights.size());
+        vk_scene_uniform_buffer_mapped->shadow_source_type = shadow_source;
 
-        // Заполнение SSBO точечных источников
+        *vk_shadow_scene_buffer_mapped = shadow_view_proj;
+
         for (size_t i = 0; i < point_lights.size(); ++i) {
             vk_point_ssbo_mapped[i].position = glm::vec4(point_lights[i].position, point_lights[i].intensity);
             vk_point_ssbo_mapped[i].color = glm::vec4(point_lights[i].color, 1.0f);
         }
-
-        // Заполнение SSBO прожекторных источников
         for (size_t i = 0; i < spot_lights.size(); ++i) {
             clampSpotAngles(spot_lights[i]);
-            assert(spot_lights[i].inner_angle_deg < spot_lights[i].outer_angle_deg);
             vk_spot_ssbo_mapped[i].position = glm::vec4(spot_lights[i].position, std::cos(glm::radians(spot_lights[i].inner_angle_deg)));
             vk_spot_ssbo_mapped[i].direction = glm::vec4(spot_lights[i].direction, std::cos(glm::radians(spot_lights[i].outer_angle_deg)));
             vk_spot_ssbo_mapped[i].color = glm::vec4(spot_lights[i].color, spot_lights[i].intensity);
         }
 
-        // Расчет матриц моделей с анимацией Лиссажу 
         for (uint32_t i = 0; i < cube_count; ++i) {
             CubeSettings& s = cube_settings[i];
-
             glm::vec3 final_position = cube_offsets[i] + s.position;
             glm::vec3 final_rotation = s.rotationDeg;
 
@@ -1048,12 +1215,12 @@ namespace application {
             };
             std::memcpy(vk_model_uniform_buffer_mapped + i * model_uniform_stride, &uniform, sizeof(uniform));
         }
+
         const auto allocator = graphics::internal::context.allocator;
-        if (vmaFlushAllocation(allocator, vk_scene_uniform_buffer_allocation, 0, VK_WHOLE_SIZE) != VK_SUCCESS ||
-            vmaFlushAllocation(allocator, vk_point_ssbo_allocation, 0, VK_WHOLE_SIZE) != VK_SUCCESS ||
-            vmaFlushAllocation(allocator, vk_spot_ssbo_allocation, 0, VK_WHOLE_SIZE) != VK_SUCCESS) {
-            throw std::runtime_error("Cannot flush scene buffers");
-        }
+        vmaFlushAllocation(allocator, vk_scene_uniform_buffer_allocation, 0, VK_WHOLE_SIZE);
+        vmaFlushAllocation(allocator, vk_shadow_scene_buffer_allocation, 0, VK_WHOLE_SIZE);
+        vmaFlushAllocation(allocator, vk_point_ssbo_allocation, 0, VK_WHOLE_SIZE);
+        vmaFlushAllocation(allocator, vk_spot_ssbo_allocation, 0, VK_WHOLE_SIZE);
     }
 
     void render(const graphics::internal::FrameData& fd) {
@@ -1063,8 +1230,99 @@ namespace application {
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         };
-
         vkBeginCommandBuffer(fd.command_buffer, &begin_info);
+
+        const VkDeviceSize offset = 0;
+        vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vk_vertex_buffer, &offset);
+        vkCmdBindIndexBuffer(fd.command_buffer, vk_index_buffer, 0, VK_INDEX_TYPE_UINT32);
+
+        // переводим текстуру тени в режим записи глубины 
+        VkImageMemoryBarrier barrier_to_depth = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = 0,
+            .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vk_shadow_image,
+            .subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 },
+        };
+        vkCmdPipelineBarrier(fd.command_buffer,
+            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &barrier_to_depth);
+
+        // начинаем динамический рендеринг 
+        VkRenderingAttachmentInfo depth_attach_info = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+            .imageView = vk_shadow_image_view,
+            .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+            .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+            .clearValue = {.depthStencil = { 1.0f, 0 } },
+        };
+        VkRenderingInfo shadow_render_info = {
+            .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+            .renderArea = { {0, 0}, { SHADOW_MAP_SIZE, SHADOW_MAP_SIZE } },
+            .layerCount = 1,
+            .colorAttachmentCount = 0,
+            .pDepthAttachment = &depth_attach_info,
+        };
+        vkCmdBeginRendering(fd.command_buffer, &shadow_render_info);
+
+        VkViewport shadow_viewport = { 0.0f, 0.0f, float(SHADOW_MAP_SIZE), float(SHADOW_MAP_SIZE), 0.0f, 1.0f };
+        VkRect2D shadow_scissor = { {0, 0}, { SHADOW_MAP_SIZE, SHADOW_MAP_SIZE } };
+        vkCmdSetViewport(fd.command_buffer, 0, 1, &shadow_viewport);
+        vkCmdSetScissor(fd.command_buffer, 0, 1, &shadow_scissor);
+        vkCmdSetDepthBias(fd.command_buffer, depth_bias_constant, 0.0f, depth_bias_slope);
+
+        // отрисовка всех объектов в карту тени
+        vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_shadow_pipeline);
+        vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+            vk_shadow_pipeline_layout, 0, 1, &vk_shadow_scene_descriptor_set, 0, nullptr);
+
+        for (uint32_t i = 0; i < cube_count; ++i) {
+            const auto& settings = cube_settings[i];
+            const uint32_t dynamic_offset = static_cast<uint32_t>(i * model_uniform_stride);
+            vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                vk_shadow_pipeline_layout, 1, 1, &vk_material_descriptor_sets[settings.material], 1, &dynamic_offset);
+            vkCmdDrawIndexed(fd.command_buffer, cube_index_count, 1, 0, 0, 0);
+        }
+
+        vkCmdEndRendering(fd.command_buffer);
+
+        // переводим текстуру тени в режим чтения шейдером 
+        VkImageMemoryBarrier barrier_to_read = {
+            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = vk_shadow_image,
+            .subresourceRange = { VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1 },
+        };
+        vkCmdPipelineBarrier(fd.command_buffer,
+            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &barrier_to_read);
+
+        const float menu_w_pixels = float(graphics::internal::context.swapchain_extent.width) * (controlsWidth() / ImGui::GetIO().DisplaySize.x);
+        const float scene_x = menu_w_pixels;
+        const float scene_w = float(graphics::internal::context.swapchain_extent.width) - menu_w_pixels;
+
+        const VkViewport viewport = {
+            .x = scene_x, .y = 0.0f,
+            .width = scene_w,
+            .height = float(graphics::internal::context.swapchain_extent.height),
+            .minDepth = 0.0f, .maxDepth = 1.0f,
+        };
+        const VkRect2D scissor = {
+            .offset = { int32_t(scene_x), 0 },
+            .extent = { uint32_t(scene_w), graphics::internal::context.swapchain_extent.height }
+        };
 
         const VkClearValue clear_values[] = {
             {.color = {.float32 = { 0.05f, 0.05f, 0.08f, 1.0f } } },
@@ -1081,25 +1339,10 @@ namespace application {
         };
 
         vkCmdBeginRenderPass(fd.command_buffer, &render_pass_begin, VK_SUBPASS_CONTENTS_INLINE);
-
-        const VkViewport viewport = {
-            .x = 0.0f, .y = 0.0f,
-            .width = float(sceneWidth()),
-            .height = float(graphics::internal::context.swapchain_extent.height),
-            .minDepth = 0.0f, .maxDepth = 1.0f,
-        };
-        const VkRect2D scissor = { .extent = { sceneWidth(), graphics::internal::context.swapchain_extent.height } };
-
         vkCmdSetViewport(fd.command_buffer, 0, 1, &viewport);
         vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
 
-        // Отрисовка освещаемых кубов
         vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_pipeline);
-
-        const VkDeviceSize offset = 0;
-        vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vk_vertex_buffer, &offset);
-        vkCmdBindIndexBuffer(fd.command_buffer, vk_index_buffer, 0, VK_INDEX_TYPE_UINT32);
-
         vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
             vk_pipeline_layout, 0, 1, &vk_scene_descriptor_set, 0, nullptr);
 
@@ -1115,30 +1358,26 @@ namespace application {
             vkCmdDrawIndexed(fd.command_buffer, cube_index_count, 1, 0, 0, 0);
         }
 
-        // Визуализация источников (яркие маркеры и конусы)
         if (show_light_visualizers) {
             uint32_t marker_index = cube_count;
             vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_unlit_pipeline);
             vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                 vk_pipeline_layout, 0, 1, &vk_scene_descriptor_set, 0, nullptr);
 
-            // Точечные источники
             for (const auto& pl : point_lights) {
                 glm::mat4 m = glm::translate(glm::mat4(1.0f), pl.position);
-                m = glm::scale(m, glm::vec3(0.12f));
+                m = glm::scale(m, glm::vec3(0.2f));
                 bindMarkerUniform(fd.command_buffer, marker_index, m, glm::vec4(pl.color, 1.0f));
-                vkCmdDrawIndexed(fd.command_buffer, cube_index_count, 1, 0, 0, 0);
+                vkCmdDrawIndexed(fd.command_buffer, cube_index_count, 1, 0, 0, 0); 
             }
 
-            // Прожекторные источники
             for (const auto& sl : spot_lights) {
                 glm::mat4 m = glm::translate(glm::mat4(1.0f), sl.position);
-                m = glm::scale(m, glm::vec3(0.12f));
+                m = glm::scale(m, glm::vec3(0.2f));
                 bindMarkerUniform(fd.command_buffer, marker_index, m, glm::vec4(sl.color, 1.0f));
-                vkCmdDrawIndexed(fd.command_buffer, cube_index_count, 1, 0, 0, 0);
+                vkCmdDrawIndexed(fd.command_buffer, cube_index_count, 1, 0, 0, 0); 
             }
 
-            // Конусы прожекторов
             vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, vk_unlit_lines_pipeline);
             vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vk_cone_vertex_buffer, &offset);
 
@@ -1160,13 +1399,11 @@ namespace application {
 
                 const float length = 2.5f;
 
-                // Внешний конус (Outer Angle) — белый цвет (граница затухания)
                 float radius_outer = length * std::tan(glm::radians(sl.outer_angle_deg));
                 glm::mat4 m_outer = glm::translate(glm::mat4(1.0f), sl.position) * rot * glm::scale(glm::mat4(1.0f), glm::vec3(radius_outer, radius_outer, length));
                 bindMarkerUniform(fd.command_buffer, marker_index, m_outer, glm::vec4(1.0f));
                 vkCmdDraw(fd.command_buffer, cone_vertex_count, 1, 0, 0);
 
-                // Внутренний конус (Inner Angle) — желтый цвет (100% яркости)
                 float radius_inner = length * std::tan(glm::radians(sl.inner_angle_deg));
                 glm::mat4 m_inner = glm::translate(glm::mat4(1.0f), sl.position) * rot * glm::scale(glm::mat4(1.0f), glm::vec3(radius_inner, radius_inner, length));
                 bindMarkerUniform(fd.command_buffer, marker_index, m_inner, glm::vec4(1.0f, 0.85f, 0.2f, 1.0f));
@@ -1176,7 +1413,7 @@ namespace application {
 
         vkCmdEndRenderPass(fd.command_buffer);
         vkEndCommandBuffer(fd.command_buffer);
-        // Marker uniforms are written during recording, before submission reads the shared buffer.
+
         if (vmaFlushAllocation(graphics::internal::context.allocator,
             vk_model_uniform_buffer_allocation, 0, VK_WHOLE_SIZE) != VK_SUCCESS) {
             throw std::runtime_error("Cannot flush model uniforms");
